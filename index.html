@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Just Intonation Tuner</title>
+    <style>
+        body { font-family: 'Times New Roman', serif; max-width: 900px; margin: 40px auto; padding: 20px; background: white; color: black; }
+        h1 { text-align: center; font-size: 24px; margin-bottom: 5px; font-weight: normal; }
+        .subtitle { text-align: center; font-size: 14px; margin-bottom: 30px; }
+        .section { border: 1px solid black; padding: 20px; margin-bottom: 20px; }
+        .section h2 { font-size: 16px; margin-top: 0; border-bottom: 1px solid black; padding-bottom: 5px; font-weight: normal; }
+        select, button { font-family: inherit; font-size: 14px; padding: 5px 10px; margin: 5px; background: white; border: 1px solid black; cursor: pointer; }
+        button:hover { background: whitesmoke; }
+        button:disabled { background: lightgray; color: gray; cursor: not-allowed; border-color: gray; }
+        .status { padding: 10px; border: 1px solid black; margin: 10px 0; font-size: 13px; }
+        .key-display { font-size: 32px; text-align: center; padding: 20px; border: 1px solid black; margin: 20px 0; min-height: 80px; display: flex; align-items: center; justify-content: center; flex-direction: column; }
+        .confidence { font-size: 12px; margin-top: 10px; }
+        label { display: block; margin-top: 10px; }
+        input[type="radio"] { margin-right: 5px; }
+        .radio-group { margin: 10px 0; }
+        .radio-group label { display: inline; margin-right: 20px; }
+        .tuning-mode-badge { display: inline-block; padding: 3px 10px; font-size: 12px; border: 1px solid black; }
+        .file-info, .key-segments { font-family: monospace; font-size: 12px; padding: 10px; border: 1px solid black; margin: 10px 0; }
+        .key-segments { font-size: 11px; max-height: 150px; overflow-y: auto; }
+        .key-segment { padding: 3px 0; border-bottom: 1px solid lightgray; }
+        .key-segment:last-child { border-bottom: none; }
+        #recordButton { min-width: 140px; }
+        #consoleDisplay { font-family: monospace; font-size: 11px; background: black; color: white; padding: 15px; max-height: 300px; overflow-y: auto; }
+        .small { font-size: 11px; }
+        .mono { font-family: monospace; }
+        .mt { margin-top: 10px; }
+        .mb { margin-bottom: 10px; }
+        .hidden { display: none; }
+        @media (max-width: 600px) {
+            body { margin: 10px; padding: 10px; }
+            h1 { font-size: 20px; }
+            .section { padding: 12px; }
+            .key-display { font-size: 24px; padding: 12px; min-height: 60px; }
+            select, button { font-size: 13px; padding: 6px 8px; margin: 3px; }
+        }
+    </style>
+</head>
+<body>
+    <h1>Just Intonation Tuner</h1>
+    <p class="subtitle">Real-time adaptive tuning system</p>
+    
+    <div class="section">
+        <h2>MIDI Configuration</h2>
+        <label>Input Device:</label>
+        <select id="midiInput"><option value="">Select MIDI Input...</option></select>
+        <label>Output Device:</label>
+        <select id="midiOutput"><option value="">Select MIDI Output...</option></select>
+        <div class="radio-group">
+            <label><input type="radio" name="outputMode" value="external" checked> External MIDI</label>
+            <label><input type="radio" name="outputMode" value="internal"> Internal Sound</label>
+        </div>
+        <div class="radio-group" style="margin-top: 8px;">
+            <label title="Recommended when the MIDI output device is the same keyboard you are playing on (e.g. Roland FP-10, Yamaha P-series, Casio PX-S). Prevents the keyboard from playing notes directly from its own keybed in parallel with the tuned MIDI loop-back, which causes a doubled / 'echoey' sound. Sends CC 122 (Local Control Off) at Start and restores it at Stop.">
+                <input type="checkbox" id="localControlOff">
+                Local Control Off
+                <span style="font-size: 11px; color: #666;">(keyboards only — avoids doubled sound when routed back to itself)</span>
+            </label>
+        </div>
+    </div>
+    
+    <div class="section">
+        <h2>Tuning</h2>
+        <div class="mb">
+            <button id="startButton" onclick="startSystem()">Start</button>
+            <button id="stopButton" onclick="stopSystem()" disabled>Stop</button>
+            <button id="resetButton" onclick="resetSystem()">Reset</button>
+        </div>
+        <div class="key-display" id="keyDisplay">
+            <span id="keyName">—</span>
+            <span class="confidence" id="keyConfidence"></span>
+            <span class="confidence small" id="keyMethod">Ensemble detection</span>
+        </div>
+        <div class="status" id="detectionStatus">Status: Ready</div>
+        <div class="mt" style="padding: 10px; border: 1px solid black;">
+            <span class="small">Tuning Mode:</span>
+            <span id="tuningModeIndicator" class="tuning-mode-badge">MTS</span>
+            <span id="sysexStatus" class="small"></span>
+            <button id="switchToMTS" onclick="switchToMTSMode()" class="small" disabled>Use MTS</button>
+            <button id="switchToMPE" onclick="switchToMPEMode()" class="small">Use MPE</button>
+            <div class="small mt">MTS = MIDI Tuning Standard (SysEx) | MPE = Per-channel pitch bend</div>
+            <div id="sysexHelp" class="small">Switch to MPE if tuning sounds incorrect.</div>
+        </div>
+        <div class="mt">
+            <label>Detection Sensitivity:</label>
+            <select id="sensitivity">
+                <option value="low">Low (stable)</option>
+                <option value="medium" selected>Medium</option>
+                <option value="high">High (responsive)</option>
+            </select>
+        </div>
+    </div>
+    
+    <div class="section">
+        <h2>Piece Identification</h2>
+        <div class="status" id="stage1Status">Ready</div>
+        <div id="scoreProgress" class="mt"></div>
+        <div id="predictedNotes" class="mt"></div>
+        <div id="songResults" class="mt"></div>
+    </div>
+    
+    <div class="section">
+        <h2>Recording</h2>
+        <div class="mb">
+            <button id="recordButton" onclick="toggleRecording()">Record</button>
+            <button id="clearRecordingButton" onclick="clearRecordingData()" disabled>Clear</button>
+            <span id="recordingIndicator" style="margin-left: 10px;"></span>
+        </div>
+        <div id="recordingStatus" class="status">Ready</div>
+        <div id="recordingInfo" class="hidden mt small">
+            <span id="recordingDuration">0:00</span> / 10:00 | 
+            <span id="recordingNoteCount">0</span> notes | 
+            Key: <span id="recordingCurrentKey">—</span>
+            <span id="recordingKeySource" class="small"></span>
+        </div>
+        <div id="downloadSection" class="hidden mt" style="padding-top: 10px; border-top: 1px solid black;">
+            <div class="radio-group mb">
+                <label title="MIDI 1.0 + MTS Scale/Octave SysEx. Universal format — one SysEx carries the 12 pitch-class detune for the current key. Works with Pianoteq, Surge XT, Logic Sampler, and any MTS-aware synth. Does not use per-channel pitch bends."><input type="radio" name="recordingFormat" value="midi1-mts" checked> MIDI 1.0 MTS (.mid)</label>
+                <label title="MIDI 1.0 + MPE per-channel pitch bend. Track 0 contains the MPE Configuration Message (CC 127, 15) on channel 1 and RPN 0 (pitch-bend range = ±2 semitones) on each of the 15 member channels. Each note is emitted on its own member channel (2..16) with a per-note pitch-bend that encodes its JI cents deviation — exactly what the live MPE path sends. Use an MPE-aware synth (Pianoteq MPE mode, Ableton 12 MPE tracks, ROLI Equator²) for best results."><input type="radio" name="recordingFormat" value="midi1-mpe"> MIDI 1.0 MPE (.mid)</label>
+                <label title="MIDI 2.0 UMP clip file with per-note Pitch 7.25 tuning. Requires a MIDI-2.0-capable host."><input type="radio" name="recordingFormat" value="midi2"> MIDI 2.0 (.midi2)</label>
+            </div>
+            <button id="downloadRecordingButton" onclick="downloadRecordingFile()">Download</button>
+        </div>
+    </div>
+    
+    <div class="section">
+        <h2>File Tuning</h2>
+        <div class="mt">
+            <label>Select MIDI File:</label>
+            <input type="file" id="midiFileInput" accept=".mid,.midi" onchange="handleMIDIFileSelect(event)" style="font-family: inherit; padding: 5px; border: 1px solid black;">
+        </div>
+        <div class="file-info hidden" id="fileInfo"><div id="fileInfoContent">No file selected</div></div>
+        <div class="mt">
+            <label>Key Detection:</label>
+            <div class="radio-group">
+                <label><input type="radio" name="keyMode" value="auto" checked> Auto-detect</label>
+                <label><input type="radio" name="keyMode" value="manual"> Manual:</label>
+                <select id="manualKeySelect" disabled>
+                    <option value="C">C major</option><option value="G">G major</option><option value="D">D major</option>
+                    <option value="A">A major</option><option value="E">E major</option><option value="B">B major</option>
+                    <option value="F#">F# major</option><option value="F">F major</option><option value="Bb">Bb major</option>
+                    <option value="Eb">Eb major</option><option value="Ab">Ab major</option><option value="Db">Db major</option>
+                    <option value="Am">A minor</option><option value="Em">E minor</option><option value="Bm">B minor</option>
+                    <option value="F#m">F# minor</option><option value="C#m">C# minor</option><option value="G#m">G# minor</option>
+                    <option value="Dm">D minor</option><option value="Gm">G minor</option><option value="Cm">C minor</option>
+                    <option value="Fm">F minor</option><option value="Bbm">Bb minor</option><option value="Ebm">Eb minor</option>
+                </select>
+            </div>
+        </div>
+        <div class="mt">
+            <label>Output Format:</label>
+            <div class="radio-group">
+                <label><input type="radio" name="outputFormat" value="midi1" checked> MIDI 1.0 (MTS SysEx)</label>
+                <label><input type="radio" name="outputFormat" value="midi2"> MIDI 2.0 (.midi2)</label>
+            </div>
+        </div>
+        <div class="mt">
+            <button id="processButton" onclick="processMIDIFile()" disabled>Apply Tuning</button>
+            <button id="downloadButton" onclick="downloadTunedMIDI()" disabled>Download</button>
+        </div>
+        <div class="status" id="tuningStatus">Status: Select a MIDI file</div>
+        <div class="key-segments hidden" id="keySegmentsDisplay"></div>
+    </div>
+    
+    <div class="section">
+        <h2>Console</h2>
+        <div id="consoleDisplay">Initializing...</div>
+    </div>
+    
+    <script type="module" src="js/ui-controller.js"></script>
+    <script type="module" src="js/main.js"></script>
+    <script defer src="two_stage_client.js"></script>
+</body>
+</html>
