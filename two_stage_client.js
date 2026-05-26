@@ -4,9 +4,25 @@
  * Stage 2: Parangonar Score Following
  */
 
+// Configurable backend URL — falls back through:
+//   1. URL param ?backend=...   (highest priority, for testing)
+//   2. window.INSTANT_HARMONIES_BACKEND_URL (set by inline <script>)
+//   3. Hugging Face Spaces deployment (default)
+//   4. localhost (manual fallback)
+function _resolveBackendUrl() {
+    try {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('backend')) return params.get('backend');
+    } catch (e) { /* not in browser */ }
+    if (typeof window !== 'undefined' && window.INSTANT_HARMONIES_BACKEND_URL) {
+        return window.INSTANT_HARMONIES_BACKEND_URL;
+    }
+    return 'https://yoryouyoi-instant-harmonies.hf.space';
+}
+
 class TwoStageClient {
-    constructor(serverUrl = 'http://localhost:5005') {
-        this.serverUrl = serverUrl;
+    constructor(serverUrl = null) {
+        this.serverUrl = serverUrl || _resolveBackendUrl();
         this.socket = null;
         this.connected = false;
         
