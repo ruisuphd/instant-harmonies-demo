@@ -207,8 +207,12 @@ export const CHORD_JI_RATIOS = {
  *   source: "chord" if chord-relative ratio used, "key" if key-based fallback
  */
 export function calculateJICentsWithFunction(midiNote, keyName, chordInfo) {
-    // Fallback: no chord context → use key-based tuning
-    if (!chordInfo || !chordInfo.chordRootPc === undefined || !chordInfo.chordQuality) {
+    // Fallback: no chord context → use key-based tuning.
+    // P0-7 (2026-06-25): the guard's middle term was `!chordInfo.chordRootPc === undefined`,
+    // which is dead code (a boolean is never === undefined) and also wrongly treats a
+    // valid root pc of 0 as falsy. Corrected to an explicit `=== undefined` test so the
+    // fallback is intentional, and chordRootPc === 0 (C as chord root) stays valid.
+    if (!chordInfo || chordInfo.chordRootPc === undefined || !chordInfo.chordQuality) {
         return { cents: calculateJICentsForNote(midiNote, keyName), source: 'key' };
     }
 
