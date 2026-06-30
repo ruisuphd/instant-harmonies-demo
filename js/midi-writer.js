@@ -247,8 +247,8 @@ function encodeVariableLength(value) {
 // =============================================================================
 //
 // This path mirrors the live MPE runtime in `js/tuning-mpe.js`:
-//   - Track 0 emits the MPE Configuration Message (CC 127 = 15 member channels
-//     on ch 0) and the RPN 0 init sequence (pitch-bend range = ±2 semitones)
+//   - Track 0 emits the MPE Configuration Message (RP-053 RPN 6, Data Entry = 15
+//     member channels, on ch 0) and the RPN 0 init sequence (±2 semitones)
 //     on each of the 15 member channels, immediately followed by tempo/
 //     time-signature meta events.
 //   - Track 1 walks the recorded notes chronologically, allocates a member
@@ -296,9 +296,14 @@ export function exportMIDI1WithMPE(tuningResult) {
     // -------------------------------------------------------------------
     const track0Events = [];
 
-    // MPE Configuration Message on master channel 0 (CC 127 value = 15 member channels)
-    track0Events.push({ tick: 0, type: 'controlChange',
-                        channel: 0, controller: 127, value: MPE_MEMBER_CHANNEL_COUNT });
+    // MPE Configuration Message (MCM) on master channel 0. Per RP-053 the MCM is
+    // RPN 0x0006 with Data Entry MSB = number of member channels (P0-7 fix
+    // 2026-06-26; previously emitted CC 127, which is NOT the MCM — this matches
+    // the live fix in js/tuning-mpe.js so exported files actually trigger MPE mode).
+    track0Events.push({ tick: 0, type: 'controlChange', channel: 0, controller: 101, value: 0 });   // RPN MSB = 0
+    track0Events.push({ tick: 0, type: 'controlChange', channel: 0, controller: 100, value: 6 });   // RPN LSB = 6
+    track0Events.push({ tick: 0, type: 'controlChange', channel: 0, controller: 6,
+                        value: MPE_MEMBER_CHANNEL_COUNT });                                          // Data Entry MSB = N
 
     // Per-member-channel RPN 0 init (pitch-bend range = ±2 semitones, fine=0)
     for (let ch = 1; ch <= MPE_MEMBER_CHANNEL_COUNT; ch++) {

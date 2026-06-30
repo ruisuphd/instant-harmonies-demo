@@ -31,10 +31,11 @@ export function isPitchBendRangeInitialized() {
     return pitchBendRangeInitialized;
 }
 
-// MPE initialization sequence (F3 fix, 2026-04-19):
+// MPE initialization sequence (F3 fix, 2026-04-19; MCM corrected P0-7, 2026-06-25):
 //   1. MCM (MPE Configuration Message) on master channel — tells receiver to
 //      enter MPE mode with N member channels on the lower zone.
-//      CC 127 (0x7F) + data = N (0..15). MMA/AMEI RP-053 2018.
+//      Per MMA/AMEI RP-053 (2018) the MCM is RPN 0x0006 (RPN MSB 0, LSB 6) with
+//      Data Entry MSB = N (0..15) — NOT CC 127 (0x7F), which is Poly Mode On.
 //   2. Per-member-channel RPN 0 + Data Entry MSB = 2 — sets pitch-bend range
 //      to ±2 semitones per note. Matches tuning-core.js:centsToPitchBend scaling.
 //
@@ -56,9 +57,13 @@ export function initializePitchBendRange(midiOutput) {
     console.log('Initializing MPE: MCM + pitch-bend range ±2 semitones on 15 member channels...');
 
     try {
-        // 1. MCM: tell the receiver to enter MPE mode (lower zone, 15 member channels)
-        //    CC 127 on master channel; data = number of member channels.
-        midiOutput.send([0xB0 | MPE_MASTER_CHANNEL, 127, 15]);
+        // 1. MCM (MPE Configuration Message), RP-053: RPN 0x0006 on the master
+        //    channel with Data Entry MSB = number of member channels. This is
+        //    what tells strict-MPE receivers to enter lower-zone MPE mode.
+        //    (P0-7 fix 2026-06-25: previously sent CC 127, which is NOT the MCM.)
+        midiOutput.send([0xB0 | MPE_MASTER_CHANNEL, 101, 0]);                        // RPN MSB = 0
+        midiOutput.send([0xB0 | MPE_MASTER_CHANNEL, 100, 6]);                        // RPN LSB = 6 (MPE Configuration)
+        midiOutput.send([0xB0 | MPE_MASTER_CHANNEL, 6, MPE_MEMBER_CHANNELS.length]); // Data Entry MSB = N member channels
 
         // 2. Per-member-channel pitch-bend range via RPN 0
         for (const channel of MPE_MEMBER_CHANNELS) {
