@@ -4,11 +4,13 @@
  * Stage 2: Parangonar Score Following
  */
 
-// Configurable backend URL — falls back through:
-//   1. URL param ?backend=...   (highest priority, for testing)
-//   2. window.INSTANT_HARMONIES_BACKEND_URL (set by inline <script>)
-//   3. Hugging Face Spaces deployment (default)
-//   4. localhost (manual fallback)
+// Configurable backend URL — resolution order:
+//   1. URL param ?backend=...                 (highest priority, for testing)
+//   2. window.INSTANT_HARMONIES_BACKEND_URL   (set by an inline <script>)
+//   3. localhost page → local dev backend (python backend on :5005)
+//   4. deployed page  → Hugging Face Spaces backend
+// Keeping this file identical in the research repo and the public demo repo
+// makes the demo sync a plain file copy.
 function _resolveBackendUrl() {
     try {
         const params = new URLSearchParams(window.location.search);
@@ -17,12 +19,15 @@ function _resolveBackendUrl() {
     if (typeof window !== 'undefined' && window.INSTANT_HARMONIES_BACKEND_URL) {
         return window.INSTANT_HARMONIES_BACKEND_URL;
     }
+    if (typeof window !== 'undefined' && /^(localhost|127\.0\.0\.1)$/.test(window.location.hostname)) {
+        return 'http://localhost:5005';
+    }
     return 'https://yoryouyoi-instant-harmonies.hf.space';
 }
 
 class TwoStageClient {
-    constructor(serverUrl = null) {
-        this.serverUrl = serverUrl || _resolveBackendUrl();
+    constructor(serverUrl = _resolveBackendUrl()) {
+        this.serverUrl = serverUrl;
         this.socket = null;
         this.connected = false;
         
@@ -63,15 +68,28 @@ class TwoStageClient {
     
     _initializeSocket(resolve, reject) {
         this.socket = io(this.serverUrl, {
-            transports: ['websocket', 'polling'],
+            // Polling FIRST, then auto-upgrade to websocket if the server
+            // supports it. The old websocket-first order never fell back to
+            // polling, so a proxy/server without websocket (or a Space mid-
+            // wake) produced a permanent "WebSocket is closed before the
+            // connection is established" loop (observed 2026-07-08).
+            transports: ['polling', 'websocket'],
+            // The free-tier HF Space sleeps after 48 h idle and can take
+            // minutes to boot on first visit; retry for ~4 min instead of
+            // giving up after 5 s.
             reconnection: true,
-            reconnectionAttempts: 5,
-            reconnectionDelay: 1000
+            reconnectionAttempts: 30,
+            reconnectionDelay: 2000,
+            reconnectionDelayMax: 10000,
+            timeout: 20000
         });
         
         this.socket.on('connect', () => {
             const wasConnected = this.connected;
             this.connected = true;
+            this._connectAttempts = 0;
+            const statusEl = document.getElementById('stage1Status');
+            if (statusEl) statusEl.textContent = 'Ready';
             console.log('Connected to two-stage server' + (wasConnected ? ' (reconnect)' : ''));
 
             // Only reset state on initial connection, not reconnects
@@ -95,6 +113,27 @@ class TwoStageClient {
             this.currentPosition = 0;
             this.harmonicPrediction = null;
             window.clearBackendHarmonicPrediction?.();
+        });
+
+        // Surface connection failures in the Piece Identification panel
+        // instead of leaving "Ready" on screen forever. Tuning never depends
+        // on the backend, so say so explicitly.
+        this.socket.on('connect_error', (err) => {
+            this._connectAttempts = (this._connectAttempts || 0) + 1;
+            console.warn(`Two-stage backend connect_error (attempt ${this._connectAttempts}): ${err.message || err}`);
+            if (this.connected) return;
+            const statusEl = document.getElementById('stage1Status');
+            if (statusEl) {
+                statusEl.textContent = `Piece-ID backend waking up (free hosting sleeps when idle) — retrying, attempt ${this._connectAttempts}/30. Tuning features unaffected.`;
+            }
+        });
+
+        this.socket.io.on('reconnect_failed', () => {
+            console.warn('Two-stage backend unavailable after 30 attempts — piece identification disabled for this session');
+            const statusEl = document.getElementById('stage1Status');
+            if (statusEl) {
+                statusEl.textContent = 'Piece-ID backend unavailable — tuning and file export work normally. Reload to retry, or use ?backend=<url>.';
+            }
         });
         
         // Stage 1: Piece identified
