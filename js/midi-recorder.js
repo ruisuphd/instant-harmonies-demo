@@ -3,7 +3,7 @@
 
 import { processMIDIForJI, NOTE_NAMES } from './midi-file-tuner.js';
 import { exportMIDI1WithMTS, exportMIDI1WithMPE, exportMIDI2WithPitch725, downloadFile } from './midi-writer.js';
-import { getKeyRoot, isMinorKey, JI_RATIOS, ratioToCentsDeviation } from './tuning-core.js';
+import { getKeyRoot, isMinorKey, JI_RATIOS, ratioToCentsDeviation, computeAnchoredScaleOctaveTuning } from './tuning-core.js';
 
 const CONFIG = {
     maxDurationSeconds: 600,
@@ -331,21 +331,61 @@ function processRecordingForExport(options = {}) {
 
 function processWithRecordedKeys(midiData, keySegments) {
     const tunedNotes = [];
-    
+
+    // A1 fix (2026-07-12): anchor each segment's tuning table against the
+    // previous segment's APPLIED table, weighted by the pitch classes still
+    // sounding at the boundary (held notes + notes ringing under CC64), so the
+    // exported file reproduces the live continuity behaviour: common tones
+    // stay put at key changes; the syntonic comma lands on silent notes.
+    const pedalEdges = (midiData.ccEvents || [])
+        .filter((cc) => cc.controller === 64)
+        .sort((a, b) => a.time - b.time);
+    const pedalDownAt = (t) => {
+        let down = false;
+        for (const e of pedalEdges) {
+            if (e.time > t) break;
+            down = e.value >= 64;
+        }
+        return down;
+    };
+    const pedalUpBetween = (t0, t1) =>
+        pedalEdges.some((e) => e.time > t0 && e.time <= t1 && e.value < 64);
+
+    let prevTable = null;
+    for (const segment of keySegments) {
+        const b = segment.startTime;
+        const soundingPcs = midiData.notes
+            .filter((n) =>
+                (n.startTime <= b && n.endTime > b) ||                       // held across boundary
+                (pedalDownAt(b) && n.endTime <= b && n.startTime <= b &&
+                 !pedalUpBetween(n.endTime, b))                              // ringing under pedal
+            )
+            .map((n) => n.pitch % 12);
+
+        const { centsArray, offsetCents } = computeAnchoredScaleOctaveTuning(
+            getKeyRoot(segment.key), isMinorKey(segment.key), soundingPcs, prevTable
+        );
+        segment.anchoredCentsArray = centsArray;
+        segment.anchorOffsetCents = offsetCents;
+        prevTable = centsArray;
+    }
+
     for (const note of midiData.notes) {
-        const segment = keySegments.find(seg => 
+        const segment = keySegments.find(seg =>
             note.startTime >= seg.startTime && note.startTime < seg.endTime
         ) || keySegments[keySegments.length - 1];
-        
+
         const key = segment.key;
         const keyRootVal = getKeyRoot(key);
         const isMinorKey_ = isMinorKey(key);
         const ratios = isMinorKey_ ? JI_RATIOS.minor : JI_RATIOS.major;
-        
+
         const interval = ((note.pitch % 12) - (keyRootVal % 12) + 12) % 12;
         const ratio = ratios[interval] || 1.0;
-        const centsDeviation = ratioToCentsDeviation(ratio, interval);
-        
+        // A1: per-note deviation comes from the segment's ANCHORED table
+        // (ratio/interval kept for diagnostics and UI display).
+        const centsDeviation = segment.anchoredCentsArray[note.pitch % 12];
+
         tunedNotes.push({
             ...note,
             key,
@@ -392,6 +432,14 @@ export function exportAsMIDI2(options = {}) {
     return exportMIDI2WithPitch725(tuningResult);
 }
 
+// Untuned 12-TET reference of the same recording. Runs the identical export
+// pipeline as exportAsMIDI1 (same note/CC/meta content and timing) but omits
+// the MTS SysEx, so an ET-vs-JI A/B pair differs only in tuning messages.
+export function exportAsRawMIDI1(options = {}) {
+    const tuningResult = processRecordingForExport(options);
+    return exportMIDI1WithMTS(tuningResult, false);
+}
+
 /**
  * @param format One of:
  *   'midi1'     — (legacy alias) MIDI 1.0 with MTS Scale/Octave SysEx
@@ -404,6 +452,8 @@ export function exportAsMIDI2(options = {}) {
  *                 back gracefully on non-MPE synths because RPN 0 is
  *                 universal MIDI 1.0.
  *   'midi2'     — MIDI 2.0 clip file with Pitch 7.25 per-note tuning
+ *   'midi1-raw' — untuned 12-TET reference (identical notes/timing/pedal,
+ *                 no tuning messages) — the "ET" side of an A/B pair
  */
 export function downloadRecording(format = 'midi1', options = {}) {
     if (!hasRecording()) throw new Error('No recording to download');
@@ -420,6 +470,10 @@ export function downloadRecording(format = 'midi1', options = {}) {
         blob = exportAsMIDI1MPE(options);
         defaultFilename = `recording_JI_MPE_${timestamp}.mid`;
         formatLabel = 'MIDI 1.0 MPE';
+    } else if (format === 'midi1-raw') {
+        blob = exportAsRawMIDI1(options);
+        defaultFilename = `recording_RAW_12TET_${timestamp}.mid`;
+        formatLabel = 'MIDI 1.0 raw (12-TET reference)';
     } else {
         // 'midi1' (legacy alias) and 'midi1-mts' → MTS SysEx
         blob = exportAsMIDI1(options);

@@ -168,18 +168,26 @@ export function applySingleNoteTuning(midiOutput, note, cents) {
 }
 
 export function applyJITuningForKey(midiOutput, keyRoot, isMinor) {
-    if (!midiOutput) return { success: false, bytesSent: 0 };
-    
     const centsArray = calculateScaleOctaveTuning(keyRoot, isMinor);
-    
+    return applyJITuningTable(midiOutput, centsArray, `${NOTE_NAMES[keyRoot % 12]}${isMinor ? 'm' : ''}`);
+}
+
+// A1 (2026-07-12): send a precomputed 12-pc cents table. Used by main.js to
+// apply continuity-anchored tables (the anchor offset lives in the caller's
+// table; this layer only guards mode/support and transmits).
+export function applyJITuningTable(midiOutput, centsArray, label = '') {
+    if (!midiOutput || !Array.isArray(centsArray) || centsArray.length !== 12) {
+        return { success: false, bytesSent: 0 };
+    }
+
     if (mtsSupported && !mtsFallbackRequested) {
         const result = sendScaleOctaveTuning(midiOutput, centsArray);
         if (result.success) {
-            console.log(`MTS tuning applied for ${NOTE_NAMES[keyRoot % 12]}${isMinor ? 'm' : ''}`);
+            console.log(`MTS tuning applied${label ? ` for ${label}` : ''}`);
             return result;
         }
     }
-    
+
     return { success: false, bytesSent: 0 };
 }
 

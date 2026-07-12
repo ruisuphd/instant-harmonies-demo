@@ -1,6 +1,6 @@
 import { parseMIDIFile } from './midi-parser.js';
 import { processMIDIForJI } from './midi-file-tuner.js';
-import { exportMIDI1WithMTS, exportMIDI2WithPitch725, downloadFile, generateOutputFilename } from './midi-writer.js';
+import { exportMIDI1WithMTS, exportMIDI1WithMPE, exportMIDI2WithPitch725, downloadFile, generateOutputFilename } from './midi-writer.js';
 
 const consoleDiv = document.getElementById('consoleDisplay');
 const originalLog = console.log, originalWarn = console.warn, originalError = console.error;
@@ -83,6 +83,12 @@ function downloadTunedMIDI() {
         if (outputFormat === 'midi2') {
             blob = exportMIDI2WithPitch725(currentTuningResult);
             filename = generateOutputFilename(currentFileName, 'midi2');
+        } else if (outputFormat === 'midi1-mpe') {
+            blob = exportMIDI1WithMPE(currentTuningResult);
+            filename = generateOutputFilename(currentFileName, 'midi1-mpe');
+        } else if (outputFormat === 'midi1-raw') {
+            blob = exportMIDI1WithMTS(currentTuningResult, false);
+            filename = generateOutputFilename(currentFileName, 'midi1-raw');
         } else {
             blob = exportMIDI1WithMTS(currentTuningResult);
             filename = generateOutputFilename(currentFileName, 'midi1');
@@ -225,6 +231,7 @@ function downloadRecordingFile() {
             'midi1-mpe': 'MIDI 1.0 MPE (per-channel pitch bend)',
             'midi1-mts': 'MIDI 1.0 MTS (Scale/Octave SysEx)',
             'midi1': 'MIDI 1.0 MTS (legacy alias)',
+            'midi1-raw': 'MIDI 1.0 raw (12-TET reference)',
         }[format] || format;
         console.log(`Downloaded as ${label}`);
     } catch (error) { alert('Download failed: ' + error.message); }

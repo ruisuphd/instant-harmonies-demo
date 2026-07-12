@@ -4,7 +4,10 @@
 import { calculateMTSScaleTuning } from './midi-file-tuner.js';
 import { centsToPitch725, encodePerNotePitch725UMP } from './tuning-midi2.js';
 
-export function exportMIDI1WithMTS(tuningResult) {
+// includeTuning=false yields a 12-TET reference file: identical note/CC/meta
+// content and timing, but no MTS SysEx — the "ET" side of an ET-vs-JI A/B
+// pair, guaranteed to differ from the MTS export only in the tuning messages.
+export function exportMIDI1WithMTS(tuningResult, includeTuning = true) {
     const { tunedNotes, keySegments, originalMidiData } = tuningResult;
     
     const trackNumbers = new Set();
@@ -37,12 +40,17 @@ export function exportMIDI1WithMTS(tuningResult) {
         });
     }
     
-    for (const segment of keySegments) {
-        const mtsData = calculateMTSScaleTuning(segment.key);
-        track0Events.push({
-            tick: segment.startTick || 0, type: 'mtsScaleOctave',
-            centsArray: mtsData, key: segment.key
-        });
+    if (includeTuning) {
+        for (const segment of keySegments) {
+            // A1 (2026-07-12): prefer the continuity-anchored table computed by
+            // the recorder; fall back to the raw per-key table for callers that
+            // don't provide one (e.g. midi-file-tuner's ensemble path).
+            const mtsData = segment.anchoredCentsArray || calculateMTSScaleTuning(segment.key);
+            track0Events.push({
+                tick: segment.startTick || 0, type: 'mtsScaleOctave',
+                centsArray: mtsData, key: segment.key
+            });
+        }
     }
     
     track0Events.sort((a, b) => a.tick - b.tick);
@@ -333,7 +341,9 @@ export function exportMIDI1WithMPE(tuningResult) {
     // -------------------------------------------------------------------
     // Track 1 — MPE per-note events (allocated via LRU channel pool)
     // -------------------------------------------------------------------
-    const track1Events = allocateMPEEvents(sortedNotes);
+    // Pedal-aware allocation (S1): the CC stream tells the allocator which
+    // released notes are still ringing under CC64 and must keep their channels.
+    const track1Events = allocateMPEEvents(sortedNotes, originalMidiData.ccEvents || []);
 
     // Stable sort by (tick, order) — order: noteOff=0, pitchBend=1, noteOn=2
     // ensures correct MPE semantics at same-tick events:
@@ -386,49 +396,101 @@ export function exportMIDI1WithMPE(tuningResult) {
  *      for the stolen pitch on that channel at the CURRENT tick (before
  *      the new pitch-bend + note-on).
  */
-function allocateMPEEvents(sortedNotes) {
+function allocateMPEEvents(sortedNotes, ccEvents = []) {
     const POOL = MPE_MEMBER_CHANNEL_COUNT;
-    // channels[i] = { startTick, endTick, pitch } for channel (i+1), or null if free
+    // channels[i] for channel (i+1): null when free, else
+    //   { phase: 'active',  startTick, endTick, pitch }            — key down
+    //   { phase: 'ringing', startTick, endTick, pitch, freeTick }  — note-off
+    //     written, but CC64 holds the voice until freeTick (next pedal-up).
+    //
+    // Sustain model (S1 fix, 2026-07-12, mirrors js/tuning-mpe.js): a channel
+    // whose note ended under a held pedal keeps ringing on the receiving synth,
+    // so it must NOT be re-used until the pedal lifts — re-using it would let
+    // the next note's pitch bend re-tune the ringing voice. The old allocator
+    // freed at endTick and also wrote a pitch-bend reset there, which snapped
+    // every pedal-sustained note back to ET in the exported file. If a ringing
+    // channel must be stolen, CC120 (All Sound Off) is written first, because
+    // its note-off is deferred by the receiver's sustain.
     const channels = new Array(POOL).fill(null);
-    // LRU queue of channel indices (0..14 = ch 1..15); front = oldest-used = first to allocate
-    let lru = Array.from({ length: POOL }, (_, i) => i);
+    // lru: permutation of channel indices ordered by allocation recency;
+    // front = least recently allocated = first choice among FREE channels.
+    const lru = Array.from({ length: POOL }, (_, i) => i);
 
     const events = [];
 
-    // Helper: free a channel and return it to the LRU pool (at the oldest end)
-    const releaseChannel = (idx, atTick) => {
-        const state = channels[idx];
-        if (!state) return;
-        events.push({
-            tick: atTick, type: 'noteOff', order: 0,
-            channel: idx + 1, pitch: state.pitch
-        });
-        events.push({
-            tick: atTick, type: 'pitchBend', order: 1,
-            channel: idx + 1, value: 0
-        });
-        channels[idx] = null;
-        if (!lru.includes(idx)) lru.unshift(idx);  // return to oldest end
+    // Pedal (CC64) state timeline from the recording's CC stream
+    const pedalEdges = (ccEvents || [])
+        .filter((cc) => cc.controller === 64)
+        .sort((a, b) => a.tick - b.tick)
+        .map((cc) => ({ tick: cc.tick, down: cc.value >= 64 }));
+
+    const pedalDownAt = (tick) => {
+        let down = false;
+        for (const e of pedalEdges) {
+            if (e.tick > tick) break;
+            down = e.down;
+        }
+        return down;
+    };
+
+    // Tick at which a voice released at endTick actually stops sounding:
+    // endTick itself if the pedal is up, else the next pedal-up (Infinity if
+    // the pedal never lifts again — the channel then frees only at flush).
+    const sustainFreeTick = (endTick) => {
+        if (!pedalDownAt(endTick)) return endTick;
+        for (const e of pedalEdges) {
+            if (e.tick > endTick && !e.down) return e.tick;
+        }
+        return Infinity;
     };
 
     for (const note of sortedNotes) {
-        // 1. Release any channels whose note ended at or before this note's start
+        const t = note.startTick;
+
+        // 1. Retire channels: write the note-off when the note has ended, but
+        //    only FREE the channel once the pedal no longer holds its voice.
         for (let i = 0; i < POOL; i++) {
-            if (channels[i] && channels[i].endTick <= note.startTick) {
-                releaseChannel(i, channels[i].endTick);
+            const state = channels[i];
+            if (!state) continue;
+            if (state.phase === 'active' && state.endTick <= t) {
+                events.push({
+                    tick: state.endTick, type: 'noteOff', order: 0,
+                    channel: i + 1, pitch: state.pitch
+                });
+                state.phase = 'ringing';
+                state.freeTick = sustainFreeTick(state.endTick);
+            }
+            if (state.phase === 'ringing' && state.freeTick <= t) {
+                channels[i] = null;
             }
         }
 
-        // 2. Allocate a channel — prefer free (LRU head), else voice-steal oldest active
+        // 2. Allocate a channel — free pool first, then steal the oldest
+        //    RINGING voice (least damaging: its key is already up), then the
+        //    oldest ACTIVE voice as a last resort.
         let chIdx = -1;
-        for (let k = 0; k < lru.length; k++) {
-            if (channels[lru[k]] === null) {
-                chIdx = lru.splice(k, 1)[0];
-                break;
+        for (const idx of lru) {
+            if (channels[idx] === null) { chIdx = idx; break; }
+        }
+        if (chIdx === -1) {
+            let oldestEnd = Infinity;
+            for (let i = 0; i < POOL; i++) {
+                if (channels[i].phase === 'ringing' && channels[i].endTick < oldestEnd) {
+                    oldestEnd = channels[i].endTick;
+                    chIdx = i;
+                }
+            }
+            if (chIdx !== -1) {
+                // Note-off already written at endTick; CC120 silences the
+                // pedal-held voice before the channel is re-used.
+                events.push({
+                    tick: t, type: 'controlChange', order: 0,
+                    channel: chIdx + 1, controller: 120, value: 0
+                });
+                channels[chIdx] = null;
             }
         }
         if (chIdx === -1) {
-            // Voice steal — pick the active channel with the oldest startTick
             let oldestStart = Infinity;
             for (let i = 0; i < POOL; i++) {
                 if (channels[i] && channels[i].startTick < oldestStart) {
@@ -436,15 +498,26 @@ function allocateMPEEvents(sortedNotes) {
                     chIdx = i;
                 }
             }
-            // Emit note-off for the stolen pitch at the current note's start tick
-            // BEFORE the new pitch-bend / note-on (order 0 comes first).
+            // Emit note-off for the stolen pitch BEFORE the new pitch-bend /
+            // note-on (order 0 comes first); if the pedal is down that note-off
+            // is deferred by the receiver, so CC120 must follow it.
             const stolen = channels[chIdx];
             events.push({
-                tick: note.startTick, type: 'noteOff', order: 0,
+                tick: t, type: 'noteOff', order: 0,
                 channel: chIdx + 1, pitch: stolen.pitch
             });
+            if (pedalDownAt(t)) {
+                events.push({
+                    tick: t, type: 'controlChange', order: 0,
+                    channel: chIdx + 1, controller: 120, value: 0
+                });
+            }
             channels[chIdx] = null;
         }
+
+        // Move the chosen channel to the newest end of the recency order.
+        lru.splice(lru.indexOf(chIdx), 1);
+        lru.push(chIdx);
 
         // 3. Compute pitch bend from cents deviation (-100..+100 cents → raw bend)
         const cents = Number.isFinite(note.centsDeviation) ? note.centsDeviation : 0;
@@ -463,17 +536,24 @@ function allocateMPEEvents(sortedNotes) {
         });
 
         channels[chIdx] = {
+            phase: 'active',
             startTick: note.startTick,
             endTick: note.endTick,
             pitch: note.pitch
         };
-        // Push this channel to the newest end of LRU
-        lru.push(chIdx);
     }
 
-    // Flush any remaining active channels at lastTick
+    // Flush: write the note-off for channels still active at the end.
+    // ('ringing' channels already have theirs; no pitch-bend reset — each
+    // channel's bend is rewritten before its next note-on anyway, and a reset
+    // here would snap any pedal-held tail back to ET.)
     for (let i = 0; i < POOL; i++) {
-        if (channels[i]) releaseChannel(i, channels[i].endTick);
+        if (channels[i] && channels[i].phase === 'active') {
+            events.push({
+                tick: channels[i].endTick, type: 'noteOff', order: 0,
+                channel: i + 1, pitch: channels[i].pitch
+            });
+        }
     }
 
     return events;
@@ -571,5 +651,8 @@ export function downloadFile(blob, filename) {
 
 export function generateOutputFilename(originalName, format) {
     const baseName = originalName.replace(/\.(mid|midi|midi2)$/i, '');
-    return format === 'midi2' ? `${baseName}_JI.midi2` : `${baseName}_JI.mid`;
+    if (format === 'midi2') return `${baseName}_JI.midi2`;
+    if (format === 'midi1-mpe') return `${baseName}_JI_MPE.mid`;
+    if (format === 'midi1-raw') return `${baseName}_RAW_12TET.mid`;
+    return `${baseName}_JI.mid`;
 }

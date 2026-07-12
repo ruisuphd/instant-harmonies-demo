@@ -2,9 +2,10 @@
 // Handles MIDI device management, note processing, key detection, and tuning
 
 import { keyDetector, NOTE_NAMES } from './key-detection.js';
-import { getKeyRoot, isMinorKey, centsToPitchBend, pitchBendToCents, calculateJIPitchBend } from './tuning-core.js';
+import { getKeyRoot, isMinorKey, centsToPitchBend, pitchBendToCents, computeAnchoredScaleOctaveTuning } from './tuning-core.js';
 import * as mpe from './tuning-mpe.js';
 import * as mts from './tuning-mts.js';
+import { MTSTableGate } from './tuning-gate.js';
 import * as audio from './audio-engine.js';
 import * as recorder from './midi-recorder.js';
 import * as latency from './latency-metrics.js';
@@ -23,6 +24,54 @@ const MIN_NOTES_FOR_DETECTION = 8;
 let activeNoteStacks = {};
 let nextNoteId = 1;
 
+// Continuity-preserving tuning anchor (A1 fix, 2026-07-12).
+// appliedTuning holds the 12-pc cents table currently in force — INCLUDING the
+// anchor offset — so a key change can be re-anchored against what listeners
+// are actually hearing. pedalRingingPcs approximates the pitch classes still
+// sounding via the sustain pedal (cleared on CC64-up): they carry the same
+// perceptual weight as held keys when choosing the anchor offset.
+let appliedTuning = { key: null, table: null, offsetCents: 0 };
+let pedalRingingPcs = new Set();
+
+// Resolve (and cache) the anchored tuning table for a key. On a key CHANGE the
+// new table is offset so that the pitch classes sounding right now move as
+// little as possible (see tuning-core.js computeAnchoredScaleOctaveTuning);
+// the syntonic comma lands on notes nobody is sounding. With nothing sounding
+// the offset re-anchors to 0 (inaudible, and bleeds accumulated drift back
+// toward concert pitch).
+function resolveAnchoredTuning(keyName) {
+    if (!keyName) return null;
+    if (appliedTuning.key === keyName && appliedTuning.table) return appliedTuning.table;
+
+    const soundingPcs = [];
+    for (const note of Object.keys(activeNoteStacks)) soundingPcs.push(Number(note) % 12);
+    for (const pc of pedalRingingPcs) soundingPcs.push(pc);
+
+    const { centsArray, offsetCents } = computeAnchoredScaleOctaveTuning(
+        getKeyRoot(keyName), isMinorKey(keyName), soundingPcs, appliedTuning.table
+    );
+    appliedTuning = { key: keyName, table: centsArray, offsetCents };
+    if (offsetCents !== 0) {
+        console.log(`Key ${keyName}: table re-anchored ${offsetCents > 0 ? '+' : ''}${offsetCents}c for continuity`);
+    }
+    return centsArray;
+}
+
+// G1 fix (2026-07-12): bulk MTS Scale/Octave sends retune SOUNDING notes
+// instantly, so they are gated to note boundaries. While anything is held or
+// ringing under the pedal the table is queued; new attacks are covered by the
+// per-note single-note MTS message in forwardNoteExternal, so nothing sounds
+// out of tune in the interim.
+const mtsGate = new MTSTableGate((table, label) => {
+    const outputMode = document.querySelector('input[name="outputMode"]:checked')?.value;
+    if (outputMode !== 'external' || !selectedOutput) return;
+    mts.applyJITuningTable(selectedOutput, table, label);
+});
+
+function textureIsBusy() {
+    return Object.keys(activeNoteStacks).length > 0 || pedalRingingPcs.size > 0;
+}
+
 let predictiveJITable = {};
 let predictiveTuningActive = false;
 const predictiveSeenIds = new Set();
@@ -30,6 +79,11 @@ let backendHarmonicPrediction = null;
 const BACKEND_HARMONIC_TTL_MS = 1500;
 
 async function initMIDI() {
+    if (!navigator.requestMIDIAccess) {
+        console.warn('Web MIDI API not supported by this browser');
+        updateStatus('This browser has no Web MIDI support (Safari does not) — live MIDI input is disabled. File Tuning below works in any browser.');
+        return;
+    }
     try {
         midiAccess = await navigator.requestMIDIAccess({ sysex: true });
         console.log('MIDI Access obtained (SysEx enabled)');
@@ -52,8 +106,8 @@ async function initMIDI() {
             midiAccess.onstatechange = updateMIDIDevices;
             updateStatus('MIDI initialized (MPE mode)');
         } catch (basicError) {
-            console.error('Failed to get MIDI access:', basicError);
-            updateStatus('Failed to initialize MIDI: ' + basicError.message);
+            console.error('Failed to get MIDI access: ' + (basicError.message || basicError));
+            updateStatus('MIDI unavailable (' + (basicError.message || basicError) + ') — live input disabled. File Tuning below still works without a MIDI device.');
         }
     }
 }
@@ -181,7 +235,11 @@ function startSystem() {
     
     const outputMode = document.querySelector('input[name="outputMode"]:checked').value;
     if (outputMode === 'internal') {
-        audio.initAudio();
+        audio.initAudio().then(() => {
+            if (!audio.areSamplesLoaded()) {
+                updateStatus('Warning: piano samples not loaded — internal sound is silent. Check network and press Start again.');
+            }
+        });
     }
     
     if (outputMode === 'external' && selectedOutput) {
@@ -194,7 +252,9 @@ function startSystem() {
         // (2026-04-19 fix for "MPE sounds echoey on FP-10 own speaker" feedback.)
         const localOffCheckbox = document.getElementById('localControlOff');
         if (localOffCheckbox && localOffCheckbox.checked) {
-            console.log('Sending Local Control Off (CC 122, 0) on all 16 channels...');
+            console.log('Sending Local Control Off (CC 122, 0) on all 16 channels... '
+                + '(Note: some pianos, e.g. Roland FP-10, do not receive CC 122 — '
+                + 'if doubling persists, lower the instrument volume and use Internal Sound.)');
             for (let ch = 0; ch < 16; ch++) {
                 selectedOutput.send([0xB0 | ch, 122, 0]);
             }
@@ -319,9 +379,8 @@ function handleNoteOn(note, velocity, channel, hardwareTimestamp = null) {
                 
                 const outputMode = document.querySelector('input[name="outputMode"]:checked')?.value;
                 if (outputMode === 'external' && mts.isMTSSupported() && !mts.isMTSFallbackRequested()) {
-                    const keyRoot = getKeyRoot(result.key);
-                    const isMinor = isMinorKey(result.key);
-                    mts.applyJITuningForKey(selectedOutput, keyRoot, isMinor);
+                    // A1: continuity-anchored table; G1: held until the texture clears
+                    mtsGate.submit(resolveAnchoredTuning(result.key), result.key, textureIsBusy());
                 }
             }
         }
@@ -410,12 +469,18 @@ function handleNoteOff(note, channel) {
     }
     
     const outputMode = document.querySelector('input[name="outputMode"]:checked').value;
-    
+
     if (outputMode === 'internal' && audio.isSustainPedalDown()) {
         audio.addSustainedNote(note);
+        pedalRingingPcs.add(note % 12);          // A1: still audible for anchoring
     } else {
+        if (outputMode === 'external' && mpe.isSustainPedalDown()) {
+            pedalRingingPcs.add(note % 12);      // A1: rings on via the receiver's pedal
+        }
         forwardNote({ note, velocity: 0, noteId }, channel, false);
     }
+
+    mtsGate.flush(textureIsBusy());              // G1: send queued table once quiet
 }
 
 function handleControlChange(controller, value, channel) {
@@ -425,13 +490,41 @@ function handleControlChange(controller, value, channel) {
     
     if (controller === 64) {
         const outputMode = document.querySelector('input[name="outputMode"]:checked').value;
-        
+        const pedalDown = value >= 64;
+
         if (outputMode === 'internal') {
-            audio.setSustainPedal(value >= 64);
+            audio.setSustainPedal(pedalDown);
         }
-        
+
         if (outputMode === 'external' && selectedOutput) {
-            selectedOutput.send([0xB0 | channel, controller, value]);
+            if (mts.isMTSSupported()) {
+                // MTS mode: notes stay on their incoming channel — forward as-is.
+                selectedOutput.send([0xB0 | channel, controller, value]);
+            } else {
+                // S2 fix (2026-07-12): in MPE mode the notes live on member
+                // channels 1..15, NOT on the pedal's incoming channel, so a
+                // pass-through CC64 never reached them on non-MPE receivers.
+                // Broadcast to the master channel (zone-wide sustain for
+                // MPE-strict receivers, RP-053) AND every member channel
+                // (per-channel sustain for non-MPE receivers such as the
+                // FP-10 or GM modules) — covers both, duplication is benign.
+                for (let ch = 0; ch < 16; ch++) {
+                    selectedOutput.send([0xB0 | ch, controller, value]);
+                }
+            }
+            // S1 fix (2026-07-12): the MPE channel allocator must know the pedal
+            // state — released-but-ringing notes keep their channels while the
+            // pedal is down, and get them back into the pool on pedal-up.
+            mpe.setSustainPedal(pedalDown);
+        }
+
+        if (!pedalDown) {
+            // A1: nothing rings past pedal-up. G1: flush AFTER the CC64-up has
+            // been forwarded, so the receiver releases its sustained voices
+            // before the bulk table arrives (QA fix: the flush previously
+            // preceded the forward, momentarily retuning still-ringing notes).
+            pedalRingingPcs.clear();
+            mtsGate.flush(textureIsBusy());
         }
     }
 }
@@ -471,8 +564,12 @@ function applyTuning(note, velocity, channel) {
     if (!currentKey) {
         return { note, velocity, pitchBend: 0 };
     }
-    
-    const pitchBend = calculateJIPitchBend(note, currentKey);
+
+    // A1 fix (2026-07-12): tune from the anchored table (shared with the MTS
+    // path) instead of the tonic-anchored calculateJIPitchBend, so MPE bends
+    // and MTS tables agree and key changes keep common tones in place.
+    const table = resolveAnchoredTuning(currentKey);
+    const pitchBend = centsToPitchBend(table[note % 12]);
     return { note, velocity, pitchBend };
 }
 
@@ -536,12 +633,17 @@ function forwardNoteExternal(noteData, channel, isNoteOn) {
                 if (typeof allocationResult === 'object' && allocationResult.channel !== undefined) {
                     // Voice stealing happened. Emit a note-off for the STOLEN pitch on this
                     // channel BEFORE the new note-on, so the synth doesn't hang the old note.
-                    if (typeof allocationResult.stolenPitch === 'number') {
+                    // Sustained-stolen notes already got their note-off at key-up (S1).
+                    if (!allocationResult.stolenSustained && typeof allocationResult.stolenPitch === 'number') {
                         selectedOutput.send([0x80 | allocationResult.channel, allocationResult.stolenPitch, 0]);
                         totalBytesSent += 3;
                     }
-                    // Reset pitch bend on the reused channel
-                    totalBytesSent += mpe.sendPitchBend(selectedOutput, allocationResult.channel, 0);
+                    // While CC64 is down the receiver defers note-offs, so the stolen
+                    // voice keeps ringing — CC120 is the only way to free it before
+                    // the new note's pitch bend would re-tune it (S1, 2026-07-12).
+                    if (allocationResult.needsSoundOff) {
+                        totalBytesSent += mpe.sendAllSoundOff(selectedOutput, allocationResult.channel);
+                    }
                     outputChannel = allocationResult.channel;
                 } else if (typeof allocationResult === 'number') {
                     outputChannel = allocationResult;
@@ -564,7 +666,11 @@ function forwardNoteExternal(noteData, channel, isNoteOn) {
         }
     }
     
-    if (isNoteOn && pitchBendValue !== 0 && usingMTS) {
+    // G1 (2026-07-12): sync EVERY attack via single-note MTS, not only nonzero
+    // bends. While a bulk table is gated (notes ringing), the note number may
+    // still carry a stale value from an earlier key — a 0-cent target must be
+    // transmitted too, or the attack sounds at the old tuning.
+    if (isNoteOn && usingMTS) {
         const cents = pitchBendToCents(pitchBendValue);
         mtsResult = mts.applySingleNoteTuning(selectedOutput, noteData.note, cents);
         if (mtsResult.success) {
@@ -591,8 +697,17 @@ function forwardNoteExternal(noteData, channel, isNoteOn) {
     }
     
     if (!isNoteOn && !usingMTS) {
-        mpe.sendPitchBend(selectedOutput, outputChannel, 0);
-        mpe.releaseChannel(noteData.noteId);
+        // S1 fix (2026-07-12): no pitch-bend reset here. The old bend-to-0 send
+        // instantly detuned the still-ringing sustained note back to ET on every
+        // key release under pedal (each channel's bend is set again immediately
+        // before its next note-on, so the reset served no purpose).
+        if (mpe.isSustainPedalDown()) {
+            // Pedal down: the receiver keeps this voice ringing, so keep its
+            // channel owned until CC64-up (setSustainPedal releases it).
+            mpe.sustainNote(noteData.noteId);
+        } else {
+            mpe.releaseChannel(noteData.noteId);
+        }
     }
 }
 
@@ -605,6 +720,11 @@ function resetPredictiveState() {
 function resetNoteTracking() {
     activeNoteStacks = {};
     nextNoteId = 1;
+    // A1: a fresh session (or panic) starts from the tonic-anchored table —
+    // with nothing sounding, snapping the anchor offset to 0 is inaudible.
+    appliedTuning = { key: null, table: null, offsetCents: 0 };
+    pedalRingingPcs = new Set();
+    mtsGate.reset();                               // G1: drop any queued table
 }
 
 function updateStatus(message) {
@@ -688,12 +808,19 @@ function updateTuningModeDisplay() {
 function panicStop() {
     if (selectedOutput) {
         for (let channel = 0; channel < 16; channel++) {
+            // CC64-up + CC120 first: CC123 (All Notes Off) is deferred by a held
+            // sustain pedal per the MIDI spec, so on its own it doesn't silence
+            // a pedalled texture (S1, 2026-07-12).
+            selectedOutput.send([0xB0 | channel, 64, 0]);
+            selectedOutput.send([0xB0 | channel, 120, 0]);
             selectedOutput.send([0xB0 | channel, 123, 0]);
         }
     }
-    
+
     keyDetectionBuffer = [];
     audio.reset();
+    mpe.resetMPEState();
+    resetNoteTracking();
     updateStatus('All notes stopped');
 }
 
@@ -703,12 +830,13 @@ window.stopSystem = stopSystem;
 window.panicStop = panicStop;
 
 window.switchToMTSMode = function() {
-    mts.switchToMTSMode(
-        selectedOutput,
-        sysexEnabled,
-        getCurrentKeyInfo()?.key || keyDetector.getCurrentKey(),
-        updateTuningModeDisplay
-    );
+    // A1: pass no key — the raw per-key table inside switchToMTSMode would
+    // bypass the continuity anchor. Re-apply the anchored table ourselves.
+    const ok = mts.switchToMTSMode(selectedOutput, sysexEnabled, null, updateTuningModeDisplay);
+    const key = getCurrentKeyInfo()?.key || keyDetector.getCurrentKey();
+    if (ok && key && selectedOutput) {
+        mtsGate.submit(resolveAnchoredTuning(key), key, textureIsBusy());
+    }
 };
 
 window.switchToMPEMode = function() {
@@ -760,9 +888,9 @@ window.applyJITuning = function(ratioTable) {
     if (musicXMLKey && predictiveTuningActive) {
         const outputMode = document.querySelector('input[name="outputMode"]:checked')?.value;
         if (outputMode === 'external' && selectedOutput && mts.isMTSSupported() && !mts.isMTSFallbackRequested()) {
-            const keyRoot = getKeyRoot(musicXMLKey);
-            console.log(`MTS tuning applied for ${musicXMLKey} (from MusicXML)`);
-            mts.applyJITuningForKey(selectedOutput, keyRoot, musicXMLIsMinor);
+            console.log(`MTS tuning queued for ${musicXMLKey} (from MusicXML)`);
+            // A1: continuity-anchored table; G1: held until the texture clears
+            mtsGate.submit(resolveAnchoredTuning(musicXMLKey), musicXMLKey, textureIsBusy());
         }
     }
 };
@@ -796,7 +924,8 @@ window.applyBackendHarmonicPrediction = function(prediction) {
 
         const outputMode = document.querySelector('input[name="outputMode"]:checked')?.value;
         if (outputMode === 'external' && selectedOutput && mts.isMTSSupported() && !mts.isMTSFallbackRequested()) {
-            mts.applyJITuningForKey(selectedOutput, getKeyRoot(prediction.key), isMinorKey(prediction.key));
+            // A1: continuity-anchored table; G1: held until the texture clears
+            mtsGate.submit(resolveAnchoredTuning(prediction.key), prediction.key, textureIsBusy());
         }
     }
 };
@@ -812,6 +941,29 @@ window.clearLatencyStats = latency.clearStats;
 window.exportLatencyData = latency.exportData;
 window.setLatencyMetrics = latency.setEnabled;
 window.compareLatencyModes = latency.compareLatencyModes;
+
+// Preload the Salamander samples as soon as the user opts into internal
+// sound, so the first Start doesn't stall on the CDN fetch — and surface
+// load failures instead of playing silence (playNote() silently no-ops
+// while samples are missing).
+async function preloadInternalAudio() {
+    if (audio.areSamplesLoaded()) return;
+    updateStatus('Loading piano samples…');
+    try {
+        await audio.initAudio();
+        updateStatus(audio.areSamplesLoaded()
+            ? 'Piano samples loaded'
+            : 'Piano samples failed to load (CDN unreachable?) — internal sound will be silent');
+    } catch (e) {
+        updateStatus('Piano samples failed to load: ' + (e.message || e));
+    }
+}
+
+document.querySelectorAll('input[name="outputMode"]').forEach(radio => {
+    radio.addEventListener('change', function () {
+        if (this.value === 'internal') preloadInternalAudio();
+    });
+});
 
 window.addEventListener('load', () => {
     initMIDI();

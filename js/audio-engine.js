@@ -8,7 +8,12 @@ let samplesLoaded = false;
 let loadingProgress = 0;
 
 let sustainPedalDown = false;
-let sustainedNotes = new Set();
+// Voices released under the pedal, keyed by INSTANCE (S1-internal fix,
+// 2026-07-12). Previously a Set of pitch numbers: pedal-up called
+// stopNote(pitch), which also killed a re-struck voice of the same pitch the
+// player was still physically holding — the internal-engine mirror of the
+// MPE "lift pedal → silence" bug.
+let sustainedVoices = [];
 
 // Salamander samples are spaced ~3 semitones apart for efficient coverage
 const SALAMANDER_SAMPLES = [
@@ -142,13 +147,13 @@ export function playNote(note, velocity, pitchBend = 0) {
     activeNotes[note].push({ source, gainNode });
 }
 
-export function stopNote(note) {
-    if (!activeNotes[note] || !audioContext) return;
-    
+function stopVoices(voices) {
+    if (!voices || voices.length === 0 || !audioContext) return;
+
     const now = audioContext.currentTime;
     const releaseTime = 0.15;
-    
-    activeNotes[note].forEach(({ source, gainNode }) => {
+
+    voices.forEach(({ source, gainNode }) => {
         try {
             gainNode.gain.cancelScheduledValues(now);
             gainNode.gain.setValueAtTime(gainNode.gain.value, now);
@@ -158,7 +163,11 @@ export function stopNote(note) {
             // Ignore errors from already stopped sources
         }
     });
-    
+}
+
+export function stopNote(note) {
+    if (!activeNotes[note]) return;
+    stopVoices(activeNotes[note]);
     activeNotes[note] = [];
 }
 
@@ -175,19 +184,27 @@ export function isSustainPedalDown() {
     return sustainPedalDown;
 }
 
+// Key released under the pedal: move this pitch's CURRENT voices into the
+// sustained pool. A later re-strike of the same pitch creates fresh voices in
+// activeNotes, so pedal-up releases only the old instances — never a key the
+// player is still holding.
 export function addSustainedNote(note) {
-    sustainedNotes.add(note);
+    const voices = activeNotes[note];
+    if (voices && voices.length > 0) {
+        sustainedVoices.push(...voices);
+        activeNotes[note] = [];
+    }
 }
 
 export function releaseSustainedNotes() {
-    sustainedNotes.forEach(note => stopNote(note));
-    sustainedNotes.clear();
+    stopVoices(sustainedVoices);
+    sustainedVoices = [];
 }
 
 export function reset() {
     sustainPedalDown = false;
-    sustainedNotes.clear();
-    
+    releaseSustainedNotes();
+
     for (const note of Object.keys(activeNotes)) {
         stopNote(parseInt(note));
     }
@@ -201,7 +218,7 @@ export function getState() {
         loadingProgress,
         sampleCount: Object.keys(audioBuffers).length,
         sustainPedalDown,
-        sustainedNoteCount: sustainedNotes.size,
+        sustainedNoteCount: sustainedVoices.length,
         activeNoteCount: Object.keys(activeNotes).length
     };
 }

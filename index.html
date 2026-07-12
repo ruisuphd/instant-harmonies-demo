@@ -55,7 +55,7 @@
             <label><input type="radio" name="outputMode" value="internal"> Internal Sound</label>
         </div>
         <div class="radio-group" style="margin-top: 8px;">
-            <label title="Recommended when the MIDI output device is the same keyboard you are playing on (e.g. Roland FP-10, Yamaha P-series, Casio PX-S). Prevents the keyboard from playing notes directly from its own keybed in parallel with the tuned MIDI loop-back, which causes a doubled / 'echoey' sound. Sends CC 122 (Local Control Off) at Start and restores it at Stop.">
+            <label title="Recommended when the MIDI output device is the same keyboard you are playing on (e.g. Roland FP-10, Yamaha P-series, Casio PX-S). Prevents the keyboard from playing notes directly from its own keybed in parallel with the tuned MIDI loop-back, which causes a doubled / 'echoey' sound. Sends CC 122 (Local Control Off) at Start and restores it at Stop. Caveat: some entry-level pianos do NOT receive CC 122 at all (verified on the Roland FP-10, 2026-07-09) — if you still hear doubled sound with this ticked, the instrument cannot mute its own keybed: turn its volume down and monitor via Internal Sound instead.">
                 <input type="checkbox" id="localControlOff">
                 Local Control Off
                 <span style="font-size: 11px; color: #666;">(keyboards only — avoids doubled sound when routed back to itself)</span>
@@ -120,8 +120,9 @@
         <div id="downloadSection" class="hidden mt" style="padding-top: 10px; border-top: 1px solid black;">
             <div class="radio-group mb">
                 <label title="MIDI 1.0 + MTS Scale/Octave SysEx. Universal format — one SysEx carries the 12 pitch-class detune for the current key. Works with Pianoteq, Surge XT, Logic Sampler, and any MTS-aware synth. Does not use per-channel pitch bends."><input type="radio" name="recordingFormat" value="midi1-mts" checked> MIDI 1.0 MTS (.mid)</label>
-                <label title="MIDI 1.0 + MPE per-channel pitch bend. Track 0 contains the MPE Configuration Message (CC 127, 15) on channel 1 and RPN 0 (pitch-bend range = ±2 semitones) on each of the 15 member channels. Each note is emitted on its own member channel (2..16) with a per-note pitch-bend that encodes its JI cents deviation — exactly what the live MPE path sends. Use an MPE-aware synth (Pianoteq MPE mode, Ableton 12 MPE tracks, ROLI Equator²) for best results."><input type="radio" name="recordingFormat" value="midi1-mpe"> MIDI 1.0 MPE (.mid)</label>
+                <label title="MIDI 1.0 + MPE per-channel pitch bend. Track 0 contains the MPE Configuration Message (RPN 6, lower zone) on the master channel and RPN 0 (pitch-bend range = ±2 semitones) on each of the 15 member channels. Each note is emitted on its own member channel (2..16) with a per-note pitch-bend that encodes its JI cents deviation — exactly what the live MPE path sends. Use an MPE-aware synth (Pianoteq MPE mode, Ableton 12 MPE tracks, ROLI Equator²) for best results."><input type="radio" name="recordingFormat" value="midi1-mpe"> MIDI 1.0 MPE (.mid)</label>
                 <label title="MIDI 2.0 UMP clip file with per-note Pitch 7.25 tuning. Requires a MIDI-2.0-capable host."><input type="radio" name="recordingFormat" value="midi2"> MIDI 2.0 (.midi2)</label>
+                <label title="Untuned 12-TET reference. Identical notes, timing and pedal data to the MTS export but with no tuning messages — render this as the 'ET' side of an ET-vs-JI A/B pair."><input type="radio" name="recordingFormat" value="midi1-raw"> Raw 12-TET reference (.mid)</label>
             </div>
             <button id="downloadRecordingButton" onclick="downloadRecordingFile()">Download</button>
         </div>
@@ -154,8 +155,10 @@
         <div class="mt">
             <label>Output Format:</label>
             <div class="radio-group">
-                <label><input type="radio" name="outputFormat" value="midi1" checked> MIDI 1.0 (MTS SysEx)</label>
-                <label><input type="radio" name="outputFormat" value="midi2"> MIDI 2.0 (.midi2)</label>
+                <label title="MIDI 1.0 + MTS Scale/Octave SysEx. Works with Pianoteq, Surge XT, and any MTS-aware synth."><input type="radio" name="outputFormat" value="midi1" checked> MIDI 1.0 MTS (SysEx)</label>
+                <label title="MIDI 1.0 + MPE per-channel pitch bend (MCM + RPN 0 init, notes on member channels 2..16). Use an MPE-aware synth (Pianoteq MPE mode, Ableton 12 MPE tracks)."><input type="radio" name="outputFormat" value="midi1-mpe"> MIDI 1.0 MPE (.mid)</label>
+                <label title="MIDI 2.0 UMP clip file with per-note Pitch 7.25 tuning. Requires a MIDI-2.0-capable host."><input type="radio" name="outputFormat" value="midi2"> MIDI 2.0 (.midi2)</label>
+                <label title="Untuned 12-TET reference of the same file — identical notes, timing and pedal data, no tuning messages. Render this as the 'ET' side of an ET-vs-JI A/B pair."><input type="radio" name="outputFormat" value="midi1-raw"> Raw 12-TET reference (.mid)</label>
             </div>
         </div>
         <div class="mt">
