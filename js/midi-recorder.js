@@ -285,8 +285,18 @@ function buildKeySegmentsFromRecording(totalDuration, ticksPerQuarter, tempo) {
     for (let i = 0; i < recordedKeyChanges.length; i++) {
         const change = recordedKeyChanges[i];
         const nextChange = recordedKeyChanges[i + 1];
-        
-        const startTime = change.timeSeconds;
+
+        // Pre-detection fix (2026-07-13): the first key change is only recorded
+        // once the detector (or score follower) has gathered enough evidence —
+        // several notes into the take. Notes played before that boundary
+        // previously fell through processWithRecordedKeys' find() to the LAST
+        // segment (giving the MPE export the final key's anchored bends — in
+        // the 2026-07-13 Turkish March take, Am +21.5 c on the opening notes),
+        // while the MTS table was only written at the boundary tick, leaving
+        // the same notes in 12-TET for renders. Extending the first segment
+        // back to time zero tunes the opening with the first detected key in
+        // BOTH formats.
+        const startTime = i === 0 ? 0 : change.timeSeconds;
         const endTime = nextChange ? nextChange.timeSeconds : totalDuration;
         
         segments.push({
