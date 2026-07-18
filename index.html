@@ -2,6 +2,9 @@
 <html>
 <head>
     <meta charset="UTF-8">
+    <!-- QA 2026-07-17: without this, phones render the 980px legacy viewport and
+         the max-width:600px responsive rules below can never apply. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Just Intonation Tuner</title>
     <style>
         body { font-family: 'Times New Roman', serif; max-width: 900px; margin: 40px auto; padding: 20px; background: white; color: black; }
@@ -27,6 +30,11 @@
         #recordButton { min-width: 140px; }
         #consoleDisplay { font-family: monospace; font-size: 11px; background: black; color: white; padding: 15px; max-height: 300px; overflow-y: auto; }
         .small { font-size: 11px; }
+        .section-desc { font-size: 12px; color: #333; line-height: 1.55; margin: 6px 0 14px; }
+        .masthead { text-align: center; font-size: 13px; line-height: 1.7; margin: -16px 0 26px; }
+        .masthead .affil { font-size: 11.5px; color: #333; }
+        .abstract { font-size: 13px; line-height: 1.65; text-align: justify; margin: 0; }
+        .site-footer { font-size: 11.5px; text-align: center; color: #333; line-height: 1.7; margin: 28px 0 10px; }
         .mono { font-family: monospace; }
         .mt { margin-top: 10px; }
         .mb { margin-bottom: 10px; }
@@ -43,9 +51,40 @@
 <body>
     <h1>Just Intonation Tuner</h1>
     <p class="subtitle">Real-time adaptive tuning system</p>
-    
+
+    <div class="masthead">
+        <p>A research prototype of the doctoral project <i>Instant Harmonies</i></p>
+        <p><b>Rui Su</b><sup>1</sup> — PhD candidate<br>
+        Supervisor: <b>Joseph Timoney</b><sup>1</sup> &nbsp;·&nbsp; Co-supervisor: <b>Damián Keller</b><sup>2,3</sup></p>
+        <p class="affil"><sup>1</sup>&thinsp;Maynooth University, Maynooth, Ireland &nbsp;·&nbsp;
+        <sup>2</sup>&thinsp;Federal University of Acre, Brazil &nbsp;·&nbsp;
+        <sup>3</sup>&thinsp;Ubiquitous Music Group</p>
+    </div>
+
+    <div class="section">
+        <h2>About This Research</h2>
+        <p class="abstract">This application is the research prototype of <i>Instant
+        Harmonies</i>, a doctoral project investigating real-time adaptive just intonation
+        for keyboard performance, situated within the ubiquitous-music (Ubimus) research
+        agenda. As a performer plays, the system infers the prevailing tonal centre —
+        through a neural harmonic-context model, a classical key-profile ensemble, and
+        optionally score-informed alignment against an identified piece — and retunes every
+        note to 5-limit just-intonation ratios within a millisecond-scale budget. Key
+        changes are continuity-anchored so that sounding pitches do not shift audibly, and
+        tuning is delivered through a multi-protocol architecture (MTS, MPE, and MIDI 2.0)
+        that trades resolution against device compatibility. The prototype runs natively in
+        the browser via the Web MIDI API; the controls below expose every detector and
+        transport for controlled comparison.</p>
+    </div>
+
     <div class="section">
         <h2>MIDI Configuration</h2>
+        <p class="section-desc">Routes MIDI between the instrument and the tuning engine.
+        <b>External MIDI</b> returns retuned events to a hardware or software synthesiser in
+        real time; <b>Internal Sound</b> renders through the browser's Web Audio sampler
+        (Salamander grand piano) with no external equipment. <b>Local Control Off</b>
+        (CC&nbsp;122) prevents a self-routed keyboard from sounding its own untuned keybed
+        alongside the retuned stream.</p>
         <label>Input Device:</label>
         <select id="midiInput"><option value="">Select MIDI Input...</option></select>
         <label>Output Device:</label>
@@ -64,7 +103,15 @@
     </div>
     
     <div class="section">
-        <h2>Tuning</h2>
+        <h2>Real-Time Tuning</h2>
+        <p class="section-desc">The core of the system: incoming notes are retuned to
+        5-limit just intonation relative to the prevailing tonal centre, within a
+        sub-10&nbsp;ms processing budget. Key changes are <i>continuity-anchored</i> — the
+        retuning offset is chosen so that pitch classes currently sounding do not move, and
+        the syntonic comma falls on scale degrees whose harmonic function has genuinely
+        changed. Tuning is transmitted either as MTS Scale/Octave SysEx (MIDI Tuning
+        Standard; table-based, 0.0122-cent resolution) or as MPE per-note pitch bends on
+        fifteen member channels with sustain-aware voice management.</p>
         <div class="mb">
             <button id="startButton" onclick="startSystem()">Start</button>
             <button id="stopButton" onclick="stopSystem()" disabled>Stop</button>
@@ -85,8 +132,32 @@
             <div class="small mt">MTS = MIDI Tuning Standard (SysEx) | MPE = Per-channel pitch bend</div>
             <div id="sysexHelp" class="small">Switch to MPE if tuning sounds incorrect.</div>
         </div>
+        <div class="mt" style="padding: 10px; border: 1px solid black;">
+            <label title="Selects which key detector drives the tonal centre. Auto is the research default: score-informed key while a piece is being followed, otherwise the neural harmonic-context model (T6_T1 GRU) with the classical profile ensemble as fallback. The single-detector modes isolate one detector for controlled comparison (ablation); Manual fixes the tonal centre and disables detection. Continuity anchoring applies identically in every mode, so switching mid-performance does not move sounding notes.">Key Source:</label>
+            <select id="keySource">
+                <option value="auto" selected>Auto — GRU + classical fallback (recommended)</option>
+                <option value="gru">GRU harmonic model only</option>
+                <option value="classical">Classical ensemble only</option>
+                <option value="manual">Manual key</option>
+            </select>
+            <select id="liveManualKey" class="hidden">
+                <option value="C">C major</option><option value="G">G major</option><option value="D">D major</option>
+                <option value="A">A major</option><option value="E">E major</option><option value="B">B major</option>
+                <option value="F#">F# major</option><option value="F">F major</option><option value="Bb">Bb major</option>
+                <option value="Eb">Eb major</option><option value="Ab">Ab major</option><option value="Db">Db major</option>
+                <option value="Am">A minor</option><option value="Em">E minor</option><option value="Bm">B minor</option>
+                <option value="F#m">F# minor</option><option value="C#m">C# minor</option><option value="G#m">G# minor</option>
+                <option value="Dm">D minor</option><option value="Gm">G minor</option><option value="Cm">C minor</option>
+                <option value="Fm">F minor</option><option value="Bbm">Bb minor</option><option value="Ebm">Eb minor</option>
+            </select>
+            <div class="small mt"><b>Auto</b> — score-informed when a piece is identified; otherwise the neural
+            harmonic-context model (T6_T1 GRU) while its prediction is fresh, falling back to the classical
+            profile ensemble (Albrecht–Shanahan / Temperley / Krumhansl–Kessler). <b>GRU only</b> /
+            <b>Classical only</b> isolate a single detector for controlled comparison. <b>Manual</b> fixes
+            the tonal centre and bypasses detection entirely.</div>
+        </div>
         <div class="mt">
-            <label>Detection Sensitivity:</label>
+            <label title="Applies to the classical profile ensemble only: trades switching hysteresis against responsiveness (score threshold, margin, evidence streak, and histogram decay).">Detection Sensitivity (classical ensemble):</label>
             <select id="sensitivity">
                 <option value="low">Low (stable)</option>
                 <option value="medium" selected>Medium</option>
@@ -97,6 +168,13 @@
     
     <div class="section">
         <h2>Piece Identification</h2>
+        <p class="section-desc">The optional two-stage score-aware subsystem. <b>Stage 1</b>
+        identifies the piece from an n-gram fingerprint of the opening notes, matched against
+        an ATEPP-derived database of classical repertoire; <b>Stage 2</b> aligns the live
+        performance to the identified score in real time and supplies score-informed key
+        context and predictive per-note tuning. Both stages act only under the <b>Auto</b>
+        key-source policy; if identification fails or the piece is unknown, performance
+        continues score-free without interruption.</p>
         <div class="status" id="stage1Status">Ready</div>
         <div id="scoreProgress" class="mt"></div>
         <div id="predictedNotes" class="mt"></div>
@@ -105,6 +183,13 @@
     
     <div class="section">
         <h2>Recording</h2>
+        <p class="section-desc">Captures the performance together with its tuning decisions
+        (key segments, sources, and continuity-anchored tables) and exports it for offline
+        rendering or analysis: <b>MIDI&nbsp;1.0 MTS</b> embeds one Scale/Octave SysEx table
+        per key segment; <b>MIDI&nbsp;1.0 MPE</b> writes per-note pitch bends with
+        sustain-aware channel allocation, mirroring the live MPE path byte-for-byte;
+        <b>MIDI&nbsp;2.0</b> uses per-note Pitch&nbsp;7.25; the <b>raw 12-TET reference</b>
+        is note-identical but untuned, for controlled ET-versus-JI A/B comparison.</p>
         <div class="mb">
             <button id="recordButton" onclick="toggleRecording()">Record</button>
             <button id="clearRecordingButton" onclick="clearRecordingData()" disabled>Clear</button>
@@ -130,6 +215,11 @@
     
     <div class="section">
         <h2>File Tuning</h2>
+        <p class="section-desc">Offline counterpart to the live engine: applies the same
+        5-limit just-intonation tuning to an uploaded standard MIDI file, with automatic
+        multi-segment key detection or a fixed manual key, and exports in the same formats
+        as the recorder. Useful for preparing controlled stimuli and for tuning existing
+        repertoire without a live performance.</p>
         <div class="mt">
             <label>Select MIDI File:</label>
             <input type="file" id="midiFileInput" accept=".mid,.midi" onchange="handleMIDIFileSelect(event)" style="font-family: inherit; padding: 5px; border: 1px solid black;">
@@ -171,9 +261,18 @@
     
     <div class="section">
         <h2>Console</h2>
+        <p class="section-desc">Mirrors the engine's diagnostic log — key changes and their
+        sources, continuity-anchor offsets, MPE channel allocation and voice stealing, MTS
+        table transmissions, and transport events — for observability during experiments and
+        demonstrations.</p>
         <div id="consoleDisplay">Initializing...</div>
     </div>
-    
+
+    <p class="site-footer">© 2026 Rui Su, Maynooth University. If you use this system in academic work, please cite:<br>
+    Su, R., Timoney, J., &amp; Keller, D. (2026). A multi-protocol adaptive microtuning architecture:
+    bridging MTS, MPE, and MIDI 2.0 for struck-string just intonation.
+    In <i>Proceedings of the Sound and Music Computing Conference (SMC 2026)</i>.</p>
+
     <script type="module" src="js/ui-controller.js"></script>
     <script type="module" src="js/main.js"></script>
     <script defer src="two_stage_client.js"></script>

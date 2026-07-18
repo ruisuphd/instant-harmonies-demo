@@ -6,6 +6,7 @@ import { getKeyRoot, isMinorKey, centsToPitchBend, pitchBendToCents, computeAnch
 import * as mpe from './tuning-mpe.js';
 import * as mts from './tuning-mts.js';
 import { MTSTableGate } from './tuning-gate.js';
+import { resolveKeySource, KEY_SOURCE_MODES, KEY_SOURCE_DISPLAY } from './key-source.js';
 import * as audio from './audio-engine.js';
 import * as recorder from './midi-recorder.js';
 import * as latency from './latency-metrics.js';
@@ -23,6 +24,28 @@ const MIN_NOTES_FOR_DETECTION = 8;
 
 let activeNoteStacks = {};
 let nextNoteId = 1;
+
+// Key-source policy (KS1, 2026-07-17): which detector drives the tonal centre.
+// 'auto' | 'gru' | 'classical' | 'manual' — resolved per note through
+// resolveKeySource (js/key-source.js); persisted across sessions.
+let keySourceMode = 'auto';
+let liveManualKey = 'C';
+
+// Assemble the live context the key-source resolver decides over.
+function currentKeyContext() {
+    const twoStageClient = window.twoStageClient;
+    const systemState = twoStageClient?.systemState;
+    const scoreFollowingActive = systemState === 'following' || systemState === 'score_following_active';
+    const gru = backendHarmonicPrediction;
+    return {
+        scoreFollowingActive,
+        musicXMLKey: window._lastMusicXMLKey || null,
+        gruKey: gru?.key || null,
+        gruFresh: !!gru && (Date.now() - gru.receivedAtMs) <= BACKEND_HARMONIC_TTL_MS,
+        ensembleKey: keyDetector.getCurrentKey(),
+        manualKey: liveManualKey,
+    };
+}
 
 // Continuity-preserving tuning anchor (A1 fix, 2026-07-12).
 // appliedTuning holds the 12-pc cents table currently in force — INCLUDING the
@@ -277,7 +300,7 @@ function startSystem() {
     document.getElementById('stopButton').disabled = false;
     
     updateStatus('System running - play some notes');
-    updateKeyDisplay('Listening...', '', 'Source: score-free baseline');
+    applyKeySourceChange();   // KS1: show the active policy (manual shows its fixed key)
     
     if (outputMode === 'external') {
         updateTuningModeDisplay();
@@ -315,7 +338,7 @@ function stopSystem() {
     document.getElementById('stopButton').disabled = true;
     
     updateStatus('System stopped');
-    updateKeyDisplay('Stopped', '', 'Source: ensemble detection');
+    updateKeyDisplay('Stopped', '', 'System stopped');
     updateTuningModeDisplay();
     
     resetPredictiveState();
@@ -358,25 +381,33 @@ function handleNoteOn(note, velocity, channel, hardwareTimestamp = null) {
     keyDetectionBuffer = keyDetectionBuffer.filter(n => now - n.time < DETECTION_WINDOW);
     
     let keyDetectionRan = false;
-    if (keyDetectionBuffer.length >= MIN_NOTES_FOR_DETECTION) {
+    // KS1: the classical ensemble runs only under policies that can use it —
+    // in 'gru' and 'manual' modes it is bypassed entirely so an ablation run
+    // is never contaminated (and per-note latency drops accordingly).
+    const ensembleActive = keySourceMode === 'auto' || keySourceMode === 'classical';
+    if (ensembleActive && keyDetectionBuffer.length >= MIN_NOTES_FOR_DETECTION) {
         keyDetectionRan = true;
         const sensitivity = document.getElementById('sensitivity')?.value || 'medium';
         const activeNotes = Object.keys(activeNoteStacks).map(Number);
         const result = keyDetector.detectKey(keyDetectionBuffer, sensitivity, { activeNotes });
-        
+
         if (result) {
-            const twoStageClient = window.twoStageClient;
-            const systemState = twoStageClient ? twoStageClient.systemState : 'no_client';
-            const scoreFollowingActive = systemState === 'following' || systemState === 'score_following_active';
-            
-            if (!scoreFollowingActive) {
+            // The ensemble drives the display/tables only while it is the
+            // policy's active source: always in 'classical'; in 'auto' only
+            // when neither the score follower nor a fresh GRU prediction
+            // outranks it (resolver priority, KS1).
+            const ctx = currentKeyContext();
+            const drivesOutput = keySourceMode === 'classical' ||
+                (!ctx.scoreFollowingActive && !(ctx.gruKey && ctx.gruFresh));
+
+            if (drivesOutput) {
                 updateKeyDisplay(
                     result.key,
                     `Confidence: ${result.confidence}%${result.agreementText ? ` (${result.agreementText})` : ''}`,
-                    'Source: causal ensemble baseline'
+                    KEY_SOURCE_DISPLAY.ensemble
                 );
-                updateStatus(`Key changed to ${result.key} (causal ensemble)`);
-                
+                updateStatus(`Key changed to ${result.key} (classical ensemble)`);
+
                 const outputMode = document.querySelector('input[name="outputMode"]:checked')?.value;
                 if (outputMode === 'external' && mts.isMTSSupported() && !mts.isMTSFallbackRequested()) {
                     // A1: continuity-anchored table; G1: held until the texture clears
@@ -401,58 +432,35 @@ function handleNoteOn(note, velocity, channel, hardwareTimestamp = null) {
     }
 }
 
-function getActiveBackendHarmonicPrediction() {
-    const twoStageClient = window.twoStageClient;
-    const systemState = twoStageClient?.systemState;
-    const scoreFollowingActive = systemState === 'following' || systemState === 'score_following_active';
-    if (scoreFollowingActive || !backendHarmonicPrediction) {
-        return null;
-    }
-
-    if ((Date.now() - backendHarmonicPrediction.receivedAtMs) > BACKEND_HARMONIC_TTL_MS) {
-        return null;
-    }
-
-    return backendHarmonicPrediction;
-}
-
 function clearBackendHarmonicPrediction() {
     backendHarmonicPrediction = null;
 }
 
 function getCurrentKeyInfo() {
-    const twoStageClient = window.twoStageClient;
-    const systemState = twoStageClient?.systemState;
-    const scoreFollowingActive = systemState === 'following' || systemState === 'score_following_active';
-    
-    if (scoreFollowingActive && window._lastMusicXMLKey) {
-        return {
-            key: window._lastMusicXMLKey,
-            isMinor: window._lastMusicXMLIsMinor || false,
-            source: 'musicxml'
-        };
-    }
+    // KS1: one policy resolver for tuning, display, and the recorder alike.
+    // Source labels keep the recorder's historical vocabulary so exported key
+    // segments stay comparable across takes.
+    const resolved = resolveKeySource(keySourceMode, currentKeyContext());
+    if (!resolved) return null;
 
-    const backendPrediction = getActiveBackendHarmonicPrediction();
-    if (backendPrediction) {
-        return {
-            key: backendPrediction.key,
-            isMinor: backendPrediction.key.includes('m'),
-            source: 'harmonic_context_model',
-            confidence: backendPrediction.confidence
-        };
+    const sourceLabel = {
+        musicxml: 'musicxml',
+        gru: 'harmonic_context_model',
+        ensemble: 'causal_ensemble',
+        manual: 'manual',
+    }[resolved.source];
+
+    const info = {
+        key: resolved.key,
+        isMinor: resolved.source === 'musicxml'
+            ? (window._lastMusicXMLIsMinor || false)
+            : resolved.key.includes('m'),
+        source: sourceLabel
+    };
+    if (resolved.source === 'gru' && backendHarmonicPrediction?.confidence != null) {
+        info.confidence = backendHarmonicPrediction.confidence;
     }
-    
-    const currentKey = keyDetector.getCurrentKey();
-    if (currentKey) {
-        return {
-            key: currentKey,
-            isMinor: currentKey.includes('m'),
-            source: 'causal_ensemble'
-        };
-    }
-    
-    return null;
+    return info;
 }
 
 function handleNoteOff(note, channel) {
@@ -530,7 +538,9 @@ function handleControlChange(controller, value, channel) {
 }
 
 function applyTuning(note, velocity, channel) {
-    const queue = predictiveJITable?.[note];
+    // KS1: score-informed per-note predictive tuning belongs to the Auto
+    // policy only — single-detector and manual modes must stay pure.
+    const queue = keySourceMode === 'auto' ? predictiveJITable?.[note] : null;
     if (predictiveTuningActive && queue?.length > 0) {
         const entry = queue.shift();
         
@@ -550,25 +560,18 @@ function applyTuning(note, velocity, channel) {
         }
     }
     
-    const twoStageClient = window.twoStageClient;
-    const systemState = twoStageClient ? twoStageClient.systemState : 'no_client';
-    const scoreFollowingActive = systemState === 'following' || systemState === 'score_following_active';
-    
-    let currentKey;
-    if (scoreFollowingActive && window._lastMusicXMLKey) {
-        currentKey = window._lastMusicXMLKey;
-    } else {
-        currentKey = getActiveBackendHarmonicPrediction()?.key || keyDetector.getCurrentKey();
-    }
-    
-    if (!currentKey) {
+    // KS1: the policy resolver picks the tonal centre; until one exists the
+    // note passes through untuned (12-TET).
+    const resolved = resolveKeySource(keySourceMode, currentKeyContext());
+    if (!resolved) {
         return { note, velocity, pitchBend: 0 };
     }
 
     // A1 fix (2026-07-12): tune from the anchored table (shared with the MTS
     // path) instead of the tonic-anchored calculateJIPitchBend, so MPE bends
-    // and MTS tables agree and key changes keep common tones in place.
-    const table = resolveAnchoredTuning(currentKey);
+    // and MTS tables agree and key changes keep common tones in place — the
+    // anchoring applies identically under every key-source policy.
+    const table = resolveAnchoredTuning(resolved.key);
     const pitchBend = centsToPitchBend(table[note % 12]);
     return { note, velocity, pitchBend };
 }
@@ -885,7 +888,8 @@ window.applyJITuning = function(ratioTable) {
         }
     }
     
-    if (musicXMLKey && predictiveTuningActive) {
+    // KS1: score-informed tables belong to the Auto policy only.
+    if (keySourceMode === 'auto' && musicXMLKey && predictiveTuningActive) {
         const outputMode = document.querySelector('input[name="outputMode"]:checked')?.value;
         if (outputMode === 'external' && selectedOutput && mts.isMTSSupported() && !mts.isMTSFallbackRequested()) {
             console.log(`MTS tuning queued for ${musicXMLKey} (from MusicXML)`);
@@ -901,26 +905,32 @@ window.applyBackendHarmonicPrediction = function(prediction) {
     }
 
     const previousKey = backendHarmonicPrediction?.key;
+    // Always stored — switching to the 'gru' policy mid-performance can then
+    // pick up the latest prediction immediately (KS1).
     backendHarmonicPrediction = {
         ...prediction,
         receivedAtMs: Date.now()
     };
 
-    const twoStageClient = window.twoStageClient;
-    const systemState = twoStageClient?.systemState;
-    const scoreFollowingActive = systemState === 'following' || systemState === 'score_following_active';
-    if (scoreFollowingActive) {
-        return;
+    // KS1: predictions drive output only under policies that use the neural
+    // model. In 'auto', the score follower outranks it; in 'gru' it is the
+    // sole source (score following is ignored for ablation purity).
+    if (keySourceMode !== 'auto' && keySourceMode !== 'gru') return;
+    if (keySourceMode === 'auto') {
+        const twoStageClient = window.twoStageClient;
+        const systemState = twoStageClient?.systemState;
+        const scoreFollowingActive = systemState === 'following' || systemState === 'score_following_active';
+        if (scoreFollowingActive) return;
     }
 
     const confidencePercent = Number(prediction.confidence) * 100;
     const confidenceText = Number.isFinite(confidencePercent)
         ? `Confidence: ${confidencePercent.toFixed(1)}%`
         : '';
-    updateKeyDisplay(prediction.key, confidenceText, 'Source: backend harmonic model');
+    updateKeyDisplay(prediction.key, confidenceText, KEY_SOURCE_DISPLAY.gru);
 
     if (previousKey !== prediction.key) {
-        updateStatus(`Key changed to ${prediction.key} (backend harmonic model)`);
+        updateStatus(`Key changed to ${prediction.key} (GRU harmonic model)`);
 
         const outputMode = document.querySelector('input[name="outputMode"]:checked')?.value;
         if (outputMode === 'external' && selectedOutput && mts.isMTSSupported() && !mts.isMTSFallbackRequested()) {
@@ -931,6 +941,67 @@ window.applyBackendHarmonicPrediction = function(prediction) {
 };
 
 window.clearBackendHarmonicPrediction = clearBackendHarmonicPrediction;
+
+// KS1: apply a key-source policy change immediately — refresh the display to
+// the newly-resolved source and (in external MTS mode) queue its anchored
+// table. The A1 anchor makes even a live switch land softly: sounding common
+// tones do not move.
+function applyKeySourceChange() {
+    const resolved = resolveKeySource(keySourceMode, currentKeyContext());
+    if (resolved) {
+        updateKeyDisplay(
+            resolved.key,
+            resolved.source === 'manual' ? 'fixed tonal centre' : '',
+            KEY_SOURCE_DISPLAY[resolved.source]
+        );
+        updateStatus(`Key source: ${keySourceMode}${resolved.source === 'manual' ? ` (${resolved.key})` : ''}`);
+        const outputMode = document.querySelector('input[name="outputMode"]:checked')?.value;
+        if (outputMode === 'external' && selectedOutput && mts.isMTSSupported() && !mts.isMTSFallbackRequested()) {
+            mtsGate.submit(resolveAnchoredTuning(resolved.key), resolved.key, textureIsBusy());
+        }
+    } else {
+        updateKeyDisplay(
+            keySourceMode === 'gru' ? 'Awaiting GRU…' : 'Listening…',
+            '',
+            keySourceMode === 'gru' ? KEY_SOURCE_DISPLAY.gru : KEY_SOURCE_DISPLAY.ensemble
+        );
+    }
+}
+
+// Exposed so two_stage_client.js can defer its score-follow display updates
+// to the active policy (only Auto is score-driven).
+window.getKeySourceMode = () => keySourceMode;
+
+document.addEventListener('DOMContentLoaded', () => {
+    const keySourceSel = document.getElementById('keySource');
+    const manualSel = document.getElementById('liveManualKey');
+    if (!keySourceSel) return;
+
+    const storedMode = localStorage.getItem('keySourceMode');
+    if (storedMode && KEY_SOURCE_MODES.includes(storedMode)) keySourceMode = storedMode;
+    const storedKey = localStorage.getItem('liveManualKey');
+    if (storedKey && getKeyRoot(storedKey)) liveManualKey = storedKey;
+    keySourceSel.value = keySourceMode;
+    if (manualSel) manualSel.value = liveManualKey;
+
+    const syncManualVisibility = () => {
+        if (manualSel) manualSel.classList.toggle('hidden', keySourceMode !== 'manual');
+    };
+    syncManualVisibility();
+
+    keySourceSel.addEventListener('change', () => {
+        keySourceMode = KEY_SOURCE_MODES.includes(keySourceSel.value) ? keySourceSel.value : 'auto';
+        localStorage.setItem('keySourceMode', keySourceMode);
+        syncManualVisibility();
+        applyKeySourceChange();
+        console.log(`Key source policy: ${keySourceMode}`);
+    });
+    manualSel?.addEventListener('change', () => {
+        liveManualKey = manualSel.value;
+        localStorage.setItem('liveManualKey', liveManualKey);
+        if (keySourceMode === 'manual') applyKeySourceChange();
+    });
+});
 
 window.handleNoteOn = handleNoteOn;
 window.keyDetector = keyDetector;

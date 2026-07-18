@@ -183,7 +183,9 @@ class TwoStageClient {
             this.updateScoreFollowingDisplay(data);
             
             // Update main key display to show MusicXML key (replacing ensemble detection)
-            if (data.initial_key) {
+            // KS1 (2026-07-17): the main display is score-driven only under the
+            // Auto key-source policy — single-detector and manual modes own it.
+            if (data.initial_key && (window.getKeySourceMode?.() ?? 'auto') === 'auto') {
                 const keyNameEl = document.getElementById('keyName');
                 const keyConfEl = document.getElementById('keyConfidence');
                 const keyMethodEl = document.getElementById('keyMethod');
@@ -250,7 +252,9 @@ class TwoStageClient {
             // Without this, the main display remains stuck on the piece's initial key even though
             // position_update already reports the correct current_key inside the score-follow panel.
             // See research_data/engine_review_2026-04-19.md §A7.
-            if (data.current_key && data.current_key !== this._lastMainDisplayKey) {
+            // KS1 (2026-07-17): score-driven display only under the Auto policy.
+            if (data.current_key && data.current_key !== this._lastMainDisplayKey
+                && (window.getKeySourceMode?.() ?? 'auto') === 'auto') {
                 this._lastMainDisplayKey = data.current_key;
                 const keyNameEl = document.getElementById('keyName');
                 const keyConfEl = document.getElementById('keyConfidence');
